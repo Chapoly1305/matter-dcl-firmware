@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
             "Default is reject."
         ),
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable progress logs and only print final summary.",
+    )
     return parser.parse_args()
 
 
@@ -52,6 +57,7 @@ def main() -> None:
             networks=networks,
             dry_run=args.dry_run,
             allow_file_changes=args.allow_file_changes,
+            progress=not args.quiet,
         )
         print(
             "upload complete: "

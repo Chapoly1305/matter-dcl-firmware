@@ -72,7 +72,13 @@ def run_upload(
     networks: Sequence[str],
     dry_run: bool = False,
     allow_file_changes: bool = False,
+    progress: bool = True,
 ) -> UploadSummary:
+    reporter = _make_upload_reporter(progress)
+    started_at = time.monotonic()
+    reporter(
+        f"start: networks={','.join(networks)}, dry_run={dry_run}, source_root={config.source_root}"
+    )
     config.ensure_s3_ready()
     storage = StorageClient(config, require_s3=True)
     manifests = ManifestRepository(config, storage)
@@ -80,12 +86,19 @@ def run_upload(
 
     global_manifest = manifests.load_global_manifest()
     object_map: Dict[str, Dict[str, Any]] = global_manifest.setdefault("objects", {})
+    reporter(f"loaded global manifest: objects={len(object_map)}")
     file_records = _collect_upload_file_records(config, networks)
     summary.scanned_files = len(file_records)
+    reporter(f"scan complete: files={summary.scanned_files}")
     if not file_records:
+        reporter(f"nothing to do. elapsed={time.monotonic() - started_at:.2f}s")
         return summary
 
-    hashed_records = _hash_files_parallel(file_records, config.hash_processes)
+    reporter(f"hashing: workers={config.hash_processes}")
+    hashed_records = _hash_files_parallel(file_records, config.hash_processes, reporter=reporter)
+    reporter(f"hashing complete: records={len(hashed_records)}")
+
+    reporter("loading network manifests")
     network_manifests = {network: manifests.load_network_manifest(network) for network in networks}
     network_entries: Dict[str, Dict[str, Dict[str, Any]]] = {}
     hash_to_source_path: Dict[str, Path] = {}
@@ -120,28 +133,47 @@ def run_upload(
             "Use --allow-file-changes to permit replacing mapped hashes.\n"
             f"{details}{extra}"
         )
+    if changed_paths and allow_file_changes:
+        reporter(f"detected changed file mappings: count={len(changed_paths)} (allowed by flag)")
 
     all_hashes = sorted(hash_to_source_path.keys())
     known_hashes = {h for h in all_hashes if h in object_map}
     unknown_hashes = [h for h in all_hashes if h not in known_hashes]
+    reporter(
+        f"dedupe summary: unique_hashes={len(all_hashes)}, "
+        f"known_hashes={len(known_hashes)}, unknown_hashes={len(unknown_hashes)}"
+    )
 
     unknown_exists = _check_unknown_hashes_exist(
         storage=storage,
         config=config,
         hashes=unknown_hashes,
+        reporter=reporter,
     )
     missing_hashes = [h for h in unknown_hashes if not unknown_exists.get(h, False)]
     summary.reused_objects = len(all_hashes) - len(missing_hashes)
     summary.uploaded_objects = len(missing_hashes)
+    reporter(
+        f"object existence check complete: to_upload={summary.uploaded_objects}, "
+        f"reused={summary.reused_objects}"
+    )
 
     uploaded_sizes: Dict[str, int] = {}
     if missing_hashes and not dry_run:
+        reporter(
+            f"compress+upload: items={len(missing_hashes)}, "
+            f"compress_workers={config.compress_processes}, upload_workers={config.upload_threads}"
+        )
         uploaded_sizes = _compress_and_upload_missing_hashes(
             storage=storage,
             config=config,
             hash_to_source_path=hash_to_source_path,
             missing_hashes=missing_hashes,
+            reporter=reporter,
         )
+        reporter("compress+upload complete")
+    elif dry_run:
+        reporter("dry-run: skipping upload and manifest writes")
 
     for sha256_hex in all_hashes:
         object_key = build_object_key(config, sha256_hex)
@@ -163,11 +195,16 @@ def run_upload(
         network_manifest["files"] = entries
         if not dry_run:
             manifests.save_network_manifest(network, network_manifest)
+            reporter(f"saved network manifest: network={network}, files={len(entries)}")
+        else:
+            reporter(f"would save network manifest: network={network}, files={len(entries)}")
         summary.updated_networks += 1
 
     if not dry_run and summary.updated_networks > 0:
         manifests.save_global_manifest(global_manifest)
+        reporter(f"saved global manifest: objects={len(object_map)}")
 
+    reporter(f"done. elapsed={time.monotonic() - started_at:.2f}s")
     return summary
 
 
@@ -540,16 +577,27 @@ def _collect_upload_file_records(config: AppConfig, networks: Sequence[str]) -> 
 def _hash_files_parallel(
     file_records: Sequence[UploadFileRecord],
     workers: int,
+    reporter: Callable[[str], None] | None = None,
 ) -> List[HashedFileRecord]:
     if not file_records:
         return []
 
+    total = len(file_records)
+    progress_step = _progress_step(total)
     paths = [str(record.abs_path) for record in file_records]
     if workers <= 1 or len(file_records) < 2:
-        hashed = [_hash_file_task(path) for path in paths]
+        hashed = []
+        for idx, path in enumerate(paths, start=1):
+            hashed.append(_hash_file_task(path))
+            if reporter and (idx % progress_step == 0 or idx == total):
+                reporter(f"hash progress: {idx}/{total}")
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            hashed = list(executor.map(_hash_file_task, paths, chunksize=8))
+            hashed = []
+            for idx, result in enumerate(executor.map(_hash_file_task, paths, chunksize=8), start=1):
+                hashed.append(result)
+                if reporter and (idx % progress_step == 0 or idx == total):
+                    reporter(f"hash progress: {idx}/{total}")
 
     result: List[HashedFileRecord] = []
     for record, (sha256_hex, original_size) in zip(file_records, hashed):
@@ -569,9 +617,13 @@ def _check_unknown_hashes_exist(
     storage: StorageClient,
     config: AppConfig,
     hashes: Sequence[str],
+    reporter: Callable[[str], None] | None = None,
 ) -> Dict[str, bool]:
     if not hashes:
         return {}
+
+    total = len(hashes)
+    progress_step = _progress_step(total)
 
     def check_one(sha256_hex: str) -> tuple[str, bool]:
         object_key = build_object_key(config, sha256_hex)
@@ -580,16 +632,22 @@ def _check_unknown_hashes_exist(
     results: Dict[str, bool] = {}
     workers = max(1, min(config.head_threads, len(hashes)))
     if workers <= 1:
-        for sha256_hex in hashes:
+        for idx, sha256_hex in enumerate(hashes, start=1):
             key, exists = check_one(sha256_hex)
             results[key] = exists
+            if reporter and (idx % progress_step == 0 or idx == total):
+                reporter(f"remote check progress: {idx}/{total}")
         return results
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_hash = {executor.submit(check_one, h): h for h in hashes}
+        completed = 0
         for future in concurrent.futures.as_completed(future_to_hash):
             key, exists = future.result()
             results[key] = exists
+            completed += 1
+            if reporter and (completed % progress_step == 0 or completed == total):
+                reporter(f"remote check progress: {completed}/{total}")
     return results
 
 
@@ -598,18 +656,21 @@ def _compress_and_upload_missing_hashes(
     config: AppConfig,
     hash_to_source_path: Dict[str, Path],
     missing_hashes: Sequence[str],
+    reporter: Callable[[str], None] | None = None,
 ) -> Dict[str, int]:
     compressed_sizes: Dict[str, int] = {}
     if not missing_hashes:
         return compressed_sizes
 
+    total = len(missing_hashes)
+    progress_step = _progress_step(total)
     compress_workers = max(1, min(config.compress_processes, len(missing_hashes)))
     upload_workers = max(1, min(config.upload_threads, len(missing_hashes)))
 
     upload_futures: List[concurrent.futures.Future[tuple[str, int]]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=upload_workers) as upload_executor:
         if compress_workers <= 1:
-            for sha256_hex in missing_hashes:
+            for idx, sha256_hex in enumerate(missing_hashes, start=1):
                 src_path = hash_to_source_path[sha256_hex]
                 tmp_path, compressed_size = gzip_compress_to_temp(src_path)
                 upload_futures.append(
@@ -622,12 +683,15 @@ def _compress_and_upload_missing_hashes(
                         compressed_size,
                     )
                 )
+                if reporter and (idx % progress_step == 0 or idx == total):
+                    reporter(f"compression progress: {idx}/{total}")
         else:
             with concurrent.futures.ProcessPoolExecutor(max_workers=compress_workers) as compress_executor:
                 compression_jobs = {
                     compress_executor.submit(_compress_file_task, str(hash_to_source_path[sha256_hex])): sha256_hex
                     for sha256_hex in missing_hashes
                 }
+                compressed_done = 0
                 for future in concurrent.futures.as_completed(compression_jobs):
                     sha256_hex = compression_jobs[future]
                     tmp_file_str, compressed_size = future.result()
@@ -641,10 +705,17 @@ def _compress_and_upload_missing_hashes(
                             compressed_size,
                         )
                     )
+                    compressed_done += 1
+                    if reporter and (compressed_done % progress_step == 0 or compressed_done == total):
+                        reporter(f"compression progress: {compressed_done}/{total}")
 
+        uploaded_done = 0
         for future in concurrent.futures.as_completed(upload_futures):
             sha256_hex, compressed_size = future.result()
             compressed_sizes[sha256_hex] = compressed_size
+            uploaded_done += 1
+            if reporter and (uploaded_done % progress_step == 0 or uploaded_done == total):
+                reporter(f"upload progress: {uploaded_done}/{total}")
 
     return compressed_sizes
 
@@ -694,3 +765,23 @@ def _find_changed_file_paths(
             if old_sha and new_sha and old_sha != new_sha:
                 changed.append((network, rel_path, old_sha, new_sha))
     return changed
+
+
+def _make_upload_reporter(enabled: bool) -> Callable[[str], None]:
+    if not enabled:
+        return _noop_reporter
+
+    def report(message: str) -> None:
+        print(f"[upload] {message}", flush=True)
+
+    return report
+
+
+def _noop_reporter(_: str) -> None:
+    return None
+
+
+def _progress_step(total: int) -> int:
+    if total <= 0:
+        return 1
+    return max(1, total // 20)

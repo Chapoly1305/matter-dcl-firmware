@@ -149,6 +149,13 @@ Dry run:
 python upload.py --dry-run
 ```
 
+Progress logs are enabled by default (scan/hash/check/upload/manifest stages).
+Disable progress logs:
+
+```bash
+python upload.py --quiet
+```
+
 If an existing mapped file path now points to a different SHA256, upload is rejected by default.
 Use this only when you intentionally want to replace mappings:
 
