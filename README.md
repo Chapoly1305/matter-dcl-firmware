@@ -143,6 +143,13 @@ Dry run:
 python upload.py --dry-run
 ```
 
+If an existing mapped file path now points to a different SHA256, upload is rejected by default.
+Use this only when you intentionally want to replace mappings:
+
+```bash
+python upload.py --allow-file-changes
+```
+
 ## Uploader Credential Setup
 
 ### Option A: Use Existing AWS Credential Chain (Recommended)

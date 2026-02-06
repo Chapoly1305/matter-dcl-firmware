@@ -30,6 +30,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Scan and compute hashes, but do not upload or update manifests.",
     )
+    parser.add_argument(
+        "--allow-file-changes",
+        action="store_true",
+        help=(
+            "Allow replacing manifest mapping when an existing network file path now has a different SHA256. "
+            "Default is reject."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -39,7 +47,12 @@ def main() -> None:
         config = AppConfig.from_env(source_root=args.source_root)
         networks = args.network or list(config.networks)
 
-        summary = run_upload(config=config, networks=networks, dry_run=args.dry_run)
+        summary = run_upload(
+            config=config,
+            networks=networks,
+            dry_run=args.dry_run,
+            allow_file_changes=args.allow_file_changes,
+        )
         print(
             "upload complete: "
             f"scanned_files={summary.scanned_files}, "

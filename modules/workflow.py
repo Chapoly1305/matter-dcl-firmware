@@ -52,7 +52,12 @@ class HashedFileRecord:
     original_size: int
 
 
-def run_upload(config: AppConfig, networks: Sequence[str], dry_run: bool = False) -> UploadSummary:
+def run_upload(
+    config: AppConfig,
+    networks: Sequence[str],
+    dry_run: bool = False,
+    allow_file_changes: bool = False,
+) -> UploadSummary:
     config.ensure_s3_ready()
     storage = StorageClient(config, require_s3=True)
     manifests = ManifestRepository(config, storage)
@@ -66,6 +71,7 @@ def run_upload(config: AppConfig, networks: Sequence[str], dry_run: bool = False
         return summary
 
     hashed_records = _hash_files_parallel(file_records, config.hash_processes)
+    network_manifests = {network: manifests.load_network_manifest(network) for network in networks}
     network_entries: Dict[str, Dict[str, Dict[str, Any]]] = {}
     hash_to_source_path: Dict[str, Path] = {}
     hash_to_original_size: Dict[str, int] = {}
@@ -81,6 +87,24 @@ def run_upload(config: AppConfig, networks: Sequence[str], dry_run: bool = False
             "original_size": record.original_size,
             "compressed_size": None,
         }
+
+    changed_paths = _find_changed_file_paths(network_entries=network_entries, network_manifests=network_manifests)
+    if changed_paths and not allow_file_changes:
+        sample_limit = 10
+        sample = changed_paths[:sample_limit]
+        details = "\n".join(
+            f"- {network}/{rel_path}: {old_sha} -> {new_sha}"
+            for network, rel_path, old_sha, new_sha in sample
+        )
+        extra = ""
+        if len(changed_paths) > sample_limit:
+            extra = f"\n... and {len(changed_paths) - sample_limit} more"
+        raise ValueError(
+            "Detected SHA256 changes for existing mapped file paths. "
+            "Upload is rejected by default to avoid accidental replacement. "
+            "Use --allow-file-changes to permit replacing mapped hashes.\n"
+            f"{details}{extra}"
+        )
 
     all_hashes = sorted(hash_to_source_path.keys())
     known_hashes = {h for h in all_hashes if h in object_map}
@@ -120,7 +144,7 @@ def run_upload(config: AppConfig, networks: Sequence[str], dry_run: bool = False
     for network, entries in network_entries.items():
         for rel_path, entry in entries.items():
             entry["compressed_size"] = object_map[entry["sha256"]].get("compressed_size")
-        network_manifest = manifests.load_network_manifest(network)
+        network_manifest = network_manifests[network]
         network_manifest["files"] = entries
         if not dry_run:
             manifests.save_network_manifest(network, network_manifest)
@@ -452,3 +476,21 @@ def _compress_file_task(path_str: str) -> tuple[str, int]:
     path = Path(path_str)
     gz_path, compressed_size = gzip_compress_to_temp(path)
     return str(gz_path), compressed_size
+
+
+def _find_changed_file_paths(
+    network_entries: Dict[str, Dict[str, Dict[str, Any]]],
+    network_manifests: Dict[str, Dict[str, Any]],
+) -> List[tuple[str, str, str, str]]:
+    changed: List[tuple[str, str, str, str]] = []
+    for network, entries in network_entries.items():
+        existing_files = network_manifests.get(network, {}).get("files", {})
+        for rel_path, new_entry in entries.items():
+            old_entry = existing_files.get(rel_path)
+            if not isinstance(old_entry, dict):
+                continue
+            old_sha = str(old_entry.get("sha256", "")).strip()
+            new_sha = str(new_entry.get("sha256", "")).strip()
+            if old_sha and new_sha and old_sha != new_sha:
+                changed.append((network, rel_path, old_sha, new_sha))
+    return changed
