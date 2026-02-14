@@ -5,13 +5,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .config import AppConfig
 
 
 class ObjectNotFoundError(FileNotFoundError):
     pass
+
+
+DownloadProgressCallback = Callable[[int, Optional[int]], None]
 
 
 class StorageClient:
@@ -113,7 +116,12 @@ class StorageClient:
                 **extra,
             )
 
-    def download_file(self, object_key: str, dst_path: Path) -> None:
+    def download_file(
+        self,
+        object_key: str,
+        dst_path: Path,
+        progress: DownloadProgressCallback | None = None,
+    ) -> None:
         self._require_s3()
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -123,12 +131,19 @@ class StorageClient:
                 raise ObjectNotFoundError(object_key) from exc
             raise
         body = response["Body"]
+        total_size = _optional_int(response.get("ContentLength"))
+        downloaded = 0
+        if progress:
+            progress(downloaded, total_size)
         with dst_path.open("wb") as f:
             while True:
                 chunk = body.read(1024 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
+                downloaded += len(chunk)
+                if progress:
+                    progress(downloaded, total_size)
 
     def read_json_s3(self, object_key: str) -> Optional[dict[str, Any]]:
         self._require_s3()
@@ -150,20 +165,32 @@ class StorageClient:
             ContentType="application/json",
         )
 
-    def download_https(self, object_key: str, dst_path: Path) -> None:
+    def download_https(
+        self,
+        object_key: str,
+        dst_path: Path,
+        progress: DownloadProgressCallback | None = None,
+    ) -> None:
         url = self.build_https_url(object_key)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        req = urllib.request.Request(url=url, method="GET")
+        req = urllib.request.Request(url=url, method="GET", headers=self._https_headers())
         try:
             with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
                 if resp.status >= 400:
                     raise ObjectNotFoundError(object_key)
+                total_size = _optional_int(resp.headers.get("Content-Length"))
+                downloaded = 0
+                if progress:
+                    progress(downloaded, total_size)
                 with dst_path.open("wb") as f:
                     while True:
                         chunk = resp.read(1024 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress:
+                            progress(downloaded, total_size)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise ObjectNotFoundError(object_key) from exc
@@ -171,7 +198,7 @@ class StorageClient:
 
     def read_json_https(self, object_key: str) -> Optional[dict[str, Any]]:
         url = self.build_https_url(object_key)
-        req = urllib.request.Request(url=url, method="GET")
+        req = urllib.request.Request(url=url, method="GET", headers=self._https_headers())
         try:
             with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
                 if resp.status >= 400:
@@ -186,6 +213,9 @@ class StorageClient:
         self.config.ensure_https_ready()
         quoted = urllib.parse.quote(object_key, safe="/")
         return f"{self.config.https_base_url}/{quoted}"
+
+    def _https_headers(self) -> dict[str, str]:
+        return {"User-Agent": "matter-dcl-firmware/1.0 (+https-download)"}
 
     def _require_s3(self) -> None:
         if self._s3_client is None:
@@ -202,3 +232,12 @@ def _is_not_found_error(exc: Exception) -> bool:
         code = str((response.get("Error") or {}).get("Code", "")).strip()
         status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     return code in {"404", "NoSuchKey", "NotFound"} or status_code == 404
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

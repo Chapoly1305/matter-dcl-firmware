@@ -23,6 +23,7 @@ pip install -r requirements.txt
 Download all mapped files (both networks):
 
 ```bash
+python download.py
 python download.py --all
 ```
 
@@ -55,9 +56,13 @@ python download.py --hash <sha256>
 Restore everything in manifests:
 
 ```bash
+python download.py
 python download.py --all
 python download.py --all --network ota-testnet
 ```
+
+When restoring, existing destination files are not overwritten if their SHA256 already matches the expected manifest hash.
+Downloads run concurrently (deduplicated by SHA256 object) and show a single aggregated progress bar.
 
 Backend selection:
 
@@ -97,10 +102,11 @@ If you do not set overrides, the scripts use:
 - `OBJECT_PREFIX` (default: `objects/sha256`)
 - `MANIFEST_PREFIX` (default: `manifests`)
 - `GLOBAL_MANIFEST_KEY` (default: `manifests/global_manifest.json`)
-- `HASH_PROCESSES` (default: `CPU count`)
+- `HASH_PROCESSES` (default: `CPU count`, used for upload hashing and download pre-check hashing)
 - `COMPRESS_PROCESSES` (default: `CPU count`)
 - `UPLOAD_THREADS` (default: `CPU count`)
 - `HEAD_THREADS` (default: `CPU count`)
+- `DOWNLOAD_THREADS` (default: `CPU count`)
 
 ## What This System Does
 

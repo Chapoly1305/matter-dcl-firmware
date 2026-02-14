@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Restore all mapped files (for --network or both networks).",
+        help="Restore all mapped files (for --network or both networks). Default when no mode is given.",
     )
     parser.add_argument(
         "--output-dir",
@@ -64,8 +64,10 @@ def parse_args() -> argparse.Namespace:
 
 def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     selected_modes = sum(bool(x) for x in [args.sha256_hex, args.file_rel_path, args.all])
-    if selected_modes != 1:
-        parser.error("Specify exactly one mode: --hash OR --file (+ --network) OR --all")
+    if selected_modes == 0:
+        args.all = True
+    elif selected_modes != 1:
+        parser.error("Specify at most one mode: --hash OR --file (+ --network) OR --all")
     if args.file_rel_path and not args.network:
         parser.error("--file requires --network")
     if args.output and args.all:
@@ -90,7 +92,8 @@ def main() -> None:
         print(
             "download complete: "
             f"downloaded_objects={summary.downloaded_objects}, "
-            f"restored_files={summary.restored_files}"
+            f"restored_files={summary.restored_files}, "
+            f"skipped_existing_files={summary.skipped_existing_files}"
         )
     except Exception as exc:
         print(f"download failed: {exc}", file=sys.stderr)

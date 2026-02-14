@@ -36,6 +36,7 @@ class AppConfig:
     compress_processes: int
     upload_threads: int
     head_threads: int
+    download_threads: int
 
     @property
     def networks(self) -> Sequence[str]:
@@ -77,6 +78,7 @@ class AppConfig:
             compress_processes=_env_int("COMPRESS_PROCESSES", cpu_count),
             upload_threads=_env_int("UPLOAD_THREADS", cpu_count),
             head_threads=_env_int("HEAD_THREADS", cpu_count),
+            download_threads=_env_int("DOWNLOAD_THREADS", cpu_count),
         )
 
     def ensure_s3_ready(self) -> None:

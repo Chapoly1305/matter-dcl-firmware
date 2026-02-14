@@ -76,26 +76,39 @@ class ManifestRepository:
         return f"{self.config.manifest_prefix}/{network}_manifest.json"
 
     def _load_remote_then_cache(self, key: str) -> dict[str, Any] | None:
+        errors: list[str] = []
+
         if self.storage.can_use_s3:
             try:
                 data = self.storage.read_json_s3(key)
-            except Exception:
-                data = None
-            if data is not None:
-                self._save_cache(key, data)
-                return data
-            # If S3 backend is available, keep it as authoritative for manifests.
-            # Do not force HTTPS manifest fetches (they may be blocked by CDN/domain policy).
-            return self._load_cache(key)
+            except Exception as exc:
+                errors.append(f"S3: {type(exc).__name__}: {exc}")
+            else:
+                if data is not None:
+                    self._save_cache(key, data)
+                    return data
+
         if self.config.https_base_url:
             try:
                 data = self.storage.read_json_https(key)
-            except Exception:
-                data = None
-            if data is not None:
-                self._save_cache(key, data)
-                return data
-        return self._load_cache(key)
+            except Exception as exc:
+                errors.append(f"HTTPS: {type(exc).__name__}: {exc}")
+            else:
+                if data is not None:
+                    self._save_cache(key, data)
+                    return data
+
+        cached = self._load_cache(key)
+        if cached is not None:
+            return cached
+
+        if errors:
+            joined = "; ".join(errors)
+            raise RuntimeError(
+                f"Failed to load manifest '{key}' from remote backends and no cache is available. "
+                f"Backend errors: {joined}"
+            )
+        return None
 
     def _cache_path(self, key: str) -> Path:
         return self.cache_root / key

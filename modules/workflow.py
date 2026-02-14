@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import concurrent.futures
 import shutil
+import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Sequence
 
 from .compress_utils import gunzip_to_file_and_hash, gzip_compress_to_temp
 from .config import AppConfig
 from .hash_utils import sha256_file
 from .manifest import ManifestRepository, build_object_key, now_iso8601
-from .storage import ObjectNotFoundError, StorageClient
+from .storage import StorageClient
 
 
 @dataclass
@@ -26,6 +29,7 @@ class UploadSummary:
 class DownloadSummary:
     restored_files: int = 0
     downloaded_objects: int = 0
+    skipped_existing_files: int = 0
 
 
 @dataclass
@@ -34,6 +38,14 @@ class DownloadItem:
     object_key: str
     compression: str
     output_path: Path
+
+
+@dataclass
+class DownloadTask:
+    sha256: str
+    object_key: str
+    compression: str
+    items_to_restore: List[DownloadItem]
 
 
 @dataclass
@@ -50,6 +62,9 @@ class HashedFileRecord:
     abs_path: Path
     sha256: str
     original_size: int
+
+
+DownloadProgressCallback = Callable[[int, int | None], None]
 
 
 def run_upload(
@@ -187,33 +202,66 @@ def run_download(
     if not plan:
         raise ValueError("No files found in manifests for selected scope.")
 
+    existing_matches = _check_existing_download_targets_parallel(plan, config.hash_processes)
+    total_objects = len({item.sha256 for item in plan})
     grouped: Dict[str, List[DownloadItem]] = {}
-    for item in plan:
+    for item, is_match in zip(plan, existing_matches):
+        if is_match:
+            summary.skipped_existing_files += 1
+            continue
         grouped.setdefault(item.sha256, []).append(item)
+    grouped_items = list(grouped.items())
+    tasks: List[DownloadTask] = []
 
-    for hash_value, items in grouped.items():
+    for hash_value, items in grouped_items:
         one = items[0]
         if one.compression != "gzip":
             raise ValueError(f"Unsupported compression '{one.compression}' for {hash_value}")
+        tasks.append(
+            DownloadTask(
+                sha256=hash_value,
+                object_key=one.object_key,
+                compression=one.compression,
+                items_to_restore=items,
+            )
+        )
 
-        with tempfile.TemporaryDirectory(prefix="ota-dl-") as tmp_dir:
-            tmp_dir_path = Path(tmp_dir)
-            gz_path = tmp_dir_path / f"{hash_value}.gz"
-            raw_path = tmp_dir_path / f"{hash_value}.bin"
+    print(
+        "download plan: "
+        f"objects={total_objects}, files={len(plan)}, "
+        f"scheduled_objects={len(tasks)}, skipped_existing_files={summary.skipped_existing_files}",
+        flush=True,
+    )
+    if not tasks:
+        return summary
 
-            _download_object(storage, method, one.object_key, gz_path)
-            summary.downloaded_objects += 1
+    workers = max(1, min(config.download_threads, len(tasks)))
+    progress = _DownloadProgressBar(total_objects=len(tasks))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_hash = {
+            executor.submit(
+                _download_and_restore_task,
+                storage,
+                method,
+                task,
+                progress.make_callback(task.sha256),
+            ): task.sha256
+            for task in tasks
+        }
+        try:
+            for future in concurrent.futures.as_completed(future_to_hash):
+                hash_value = future_to_hash[future]
+                restored_files = future.result()
+                summary.downloaded_objects += 1
+                summary.restored_files += restored_files
+                progress.mark_done(hash_value)
+        except Exception:
+            for future in future_to_hash:
+                future.cancel()
+            progress.finish()
+            raise
 
-            actual_hash = gunzip_to_file_and_hash(gz_path, raw_path)
-            if actual_hash != hash_value:
-                raise ValueError(
-                    f"SHA256 mismatch for object {one.object_key}: expected {hash_value}, got {actual_hash}"
-                )
-
-            for item in items:
-                item.output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(raw_path, item.output_path)
-                summary.restored_files += 1
+    progress.finish()
 
     return summary
 
@@ -287,36 +335,93 @@ def _build_download_plan(
     return items
 
 
+def _existing_file_matches_hash(path: Path, expected_sha256: str) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    return sha256_file(path) == expected_sha256
+
+
+def _check_existing_download_targets_parallel(
+    items: Sequence[DownloadItem],
+    workers: int,
+) -> List[bool]:
+    if not items:
+        return []
+
+    tasks = [(str(item.output_path), item.sha256) for item in items]
+    if workers <= 1 or len(tasks) < 2:
+        return [_check_download_target_task(task) for task in tasks]
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_check_download_target_task, tasks, chunksize=8))
+
+
+def _check_download_target_task(task: tuple[str, str]) -> bool:
+    path_str, expected_sha256 = task
+    return _existing_file_matches_hash(Path(path_str), expected_sha256)
+
+
 def _download_object(
     storage: StorageClient,
     method: str,
     object_key: str,
     destination: Path,
+    progress: DownloadProgressCallback | None = None,
 ) -> None:
     if method == "https":
-        storage.download_https(object_key, destination)
+        storage.download_https(object_key, destination, progress=progress)
         return
 
     if method == "s3":
-        storage.download_file(object_key, destination)
+        storage.download_file(object_key, destination, progress=progress)
         return
 
     if method == "auto":
         if storage.config.https_base_url:
             try:
-                storage.download_https(object_key, destination)
+                storage.download_https(object_key, destination, progress=progress)
                 return
             except Exception:
                 if storage.can_use_s3:
-                    storage.download_file(object_key, destination)
+                    storage.download_file(object_key, destination, progress=progress)
                     return
                 raise
         if storage.can_use_s3:
-            storage.download_file(object_key, destination)
+            storage.download_file(object_key, destination, progress=progress)
             return
         raise RuntimeError("No download backend available. Configure HTTPS_BASE_URL or S3 access.")
 
     raise ValueError(f"Unsupported method: {method}")
+
+
+def _download_and_restore_task(
+    storage: StorageClient,
+    method: str,
+    task: DownloadTask,
+    progress: DownloadProgressCallback | None = None,
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="ota-dl-") as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        gz_path = tmp_dir_path / f"{task.sha256}.gz"
+        raw_path = tmp_dir_path / f"{task.sha256}.bin"
+
+        _download_object(
+            storage,
+            method,
+            task.object_key,
+            gz_path,
+            progress=progress,
+        )
+        actual_hash = gunzip_to_file_and_hash(gz_path, raw_path)
+        if actual_hash != task.sha256:
+            raise ValueError(
+                f"SHA256 mismatch for object {task.object_key}: expected {task.sha256}, got {actual_hash}"
+            )
+
+        for item in task.items_to_restore:
+            item.output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(raw_path, item.output_path)
+        return len(task.items_to_restore)
 
 
 def _iter_network_files(network_root: Path) -> Iterable[tuple[str, Path]]:
@@ -324,6 +429,101 @@ def _iter_network_files(network_root: Path) -> Iterable[tuple[str, Path]]:
     for path in sorted(files, key=lambda p: p.relative_to(network_root).as_posix()):
         rel_path = path.relative_to(network_root).as_posix()
         yield rel_path, path
+
+
+class _DownloadProgressBar:
+    def __init__(self, total_objects: int, width: int = 32) -> None:
+        self.total_objects = max(1, total_objects)
+        self.width = max(10, width)
+        self._lock = threading.Lock()
+        self._completed_objects = 0
+        self._done_tasks: set[str] = set()
+        self._downloaded_by_task: Dict[str, int] = {}
+        self._total_by_task: Dict[str, int] = {}
+        self._last_render = 0.0
+        self._max_progress = 0.0
+        self._last_line_len = 0
+        self._printed = False
+
+    def make_callback(self, task_id: str) -> DownloadProgressCallback:
+        def report(downloaded: int, total: int | None) -> None:
+            with self._lock:
+                self._downloaded_by_task[task_id] = max(0, downloaded)
+                if total is not None and total > 0:
+                    self._total_by_task[task_id] = total
+                self._render_locked(force=False)
+
+        return report
+
+    def mark_done(self, task_id: str) -> None:
+        with self._lock:
+            if task_id not in self._done_tasks:
+                self._done_tasks.add(task_id)
+                self._completed_objects += 1
+            total = self._total_by_task.get(task_id)
+            if total is not None:
+                self._downloaded_by_task[task_id] = max(self._downloaded_by_task.get(task_id, 0), total)
+            self._render_locked(force=True)
+
+    def finish(self) -> None:
+        with self._lock:
+            self._render_locked(force=True)
+            if self._printed:
+                print(file=sys.stdout, flush=True)
+
+    def _render_locked(self, force: bool) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_render < 0.1:
+            return
+
+        downloaded = sum(self._downloaded_by_task.values())
+        known_total = sum(self._total_by_task.values())
+        partial_objects = 0.0
+        for task_id, task_downloaded in self._downloaded_by_task.items():
+            if task_id in self._done_tasks:
+                continue
+            task_total = self._total_by_task.get(task_id)
+            if task_total is None or task_total <= 0:
+                continue
+            partial_objects += min(0.999, max(0.0, task_downloaded / task_total))
+
+        object_progress = min(
+            1.0, (self._completed_objects + partial_objects) / self.total_objects
+        )
+        bar_progress = max(self._max_progress, object_progress)
+        self._max_progress = bar_progress
+        filled = min(self.width, max(0, int(bar_progress * self.width)))
+        bar = "#" * filled + "-" * (self.width - filled)
+
+        if known_total > 0:
+            detail = (
+                f"{bar_progress * 100:6.2f}% | objects {self._completed_objects}/{self.total_objects} | "
+                f"bytes {_format_size(downloaded)}/{_format_size(known_total)}"
+            )
+        else:
+            detail = (
+                f"{object_progress * 100:6.2f}% | objects {self._completed_objects}/{self.total_objects} | "
+                f"downloaded {_format_size(downloaded)}"
+            )
+
+        line = f"[{bar}] {detail}"
+        pad = " " * max(0, self._last_line_len - len(line))
+        print(f"\r{line}{pad}", end="", file=sys.stdout, flush=True)
+        self._last_line_len = len(line)
+        self._printed = True
+        self._last_render = now
+
+
+def _format_size(num_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(max(0, num_bytes))
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TB"
 
 
 def _collect_upload_file_records(config: AppConfig, networks: Sequence[str]) -> List[UploadFileRecord]:
