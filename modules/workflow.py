@@ -16,6 +16,8 @@ from .hash_utils import sha256_file
 from .manifest import ManifestRepository, build_object_key, now_iso8601
 from .storage import StorageClient
 
+ADDITIONAL_LOGS_NETWORK = "additional-logs"
+
 
 @dataclass
 class UploadSummary:
@@ -70,6 +72,7 @@ DownloadProgressCallback = Callable[[int, int | None], None]
 def run_upload(
     config: AppConfig,
     networks: Sequence[str],
+    additional_logs_root: Path | None = None,
     dry_run: bool = False,
     allow_file_changes: bool = False,
     progress: bool = True,
@@ -88,6 +91,15 @@ def run_upload(
     object_map: Dict[str, Dict[str, Any]] = global_manifest.setdefault("objects", {})
     reporter(f"loaded global manifest: objects={len(object_map)}")
     file_records = _collect_upload_file_records(config, networks)
+    if additional_logs_root is not None:
+        if additional_logs_root.exists() and not additional_logs_root.is_dir():
+            raise ValueError(f"additional logs path is not a directory: {additional_logs_root}")
+        additional_records = _collect_additional_logs_file_records(additional_logs_root)
+        file_records.extend(additional_records)
+        if additional_records:
+            reporter(
+                f"included additional logs: root={additional_logs_root}, files={len(additional_records)}"
+            )
     summary.scanned_files = len(file_records)
     reporter(f"scan complete: files={summary.scanned_files}")
     if not file_records:
@@ -98,8 +110,6 @@ def run_upload(
     hashed_records = _hash_files_parallel(file_records, config.hash_processes, reporter=reporter)
     reporter(f"hashing complete: records={len(hashed_records)}")
 
-    reporter("loading network manifests")
-    network_manifests = {network: manifests.load_network_manifest(network) for network in networks}
     network_entries: Dict[str, Dict[str, Dict[str, Any]]] = {}
     hash_to_source_path: Dict[str, Path] = {}
     hash_to_original_size: Dict[str, int] = {}
@@ -115,6 +125,12 @@ def run_upload(
             "original_size": record.original_size,
             "compressed_size": None,
         }
+
+    reporter("loading network manifests")
+    manifest_networks = sorted(network_entries.keys())
+    network_manifests = {
+        network: manifests.load_network_manifest(network) for network in manifest_networks
+    }
 
     changed_paths = _find_changed_file_paths(network_entries=network_entries, network_manifests=network_manifests)
     if changed_paths and not allow_file_changes:
@@ -571,6 +587,21 @@ def _collect_upload_file_records(config: AppConfig, networks: Sequence[str]) -> 
             continue
         for rel_path, abs_path in _iter_network_files(network_root):
             records.append(UploadFileRecord(network=network, rel_path=rel_path, abs_path=abs_path))
+    return records
+
+
+def _collect_additional_logs_file_records(additional_logs_root: Path) -> List[UploadFileRecord]:
+    if not additional_logs_root.exists():
+        return []
+    records: List[UploadFileRecord] = []
+    for rel_path, abs_path in _iter_network_files(additional_logs_root):
+        records.append(
+            UploadFileRecord(
+                network=ADDITIONAL_LOGS_NETWORK,
+                rel_path=rel_path,
+                abs_path=abs_path,
+            )
+        )
     return records
 
 

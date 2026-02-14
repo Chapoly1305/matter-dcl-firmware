@@ -26,6 +26,17 @@ def parse_args() -> argparse.Namespace:
         help="Firmware root directory. Default from env FIRMWARE_SOURCE_ROOT or ./firmware.",
     )
     parser.add_argument(
+        "--additional-logs-root",
+        type=Path,
+        default=Path("additional_logs"),
+        help="Additional logs root directory to upload when present. Default: ./additional_logs.",
+    )
+    parser.add_argument(
+        "--no-additional-logs",
+        action="store_true",
+        help="Disable uploading files from --additional-logs-root.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Scan and compute hashes, but do not upload or update manifests.",
@@ -55,6 +66,7 @@ def main() -> None:
         summary = run_upload(
             config=config,
             networks=networks,
+            additional_logs_root=None if args.no_additional_logs else args.additional_logs_root,
             dry_run=args.dry_run,
             allow_file_changes=args.allow_file_changes,
             progress=not args.quiet,
